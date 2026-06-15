@@ -58,4 +58,4 @@ You can replay the full 22-minute stress-test here if you wish:
 * The C# SSH execution could probably be optimized, right now it just opens a new session per GC run.
 
 ---
-*I use this exact system for [Ray Hosting](https://ray-hosting.com), mainly because I'm a solo dev and couldn't afford enterprise hardware mitigation, and it actually works perfectly.*"
+*I use this exact system for [Ray Hosting](https://ray-hosting.com)*"
