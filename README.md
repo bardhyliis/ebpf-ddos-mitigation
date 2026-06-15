@@ -32,6 +32,13 @@ Inside GameNodeShellOperations.cs, there are two kernel tweaks I had to add to k
 
 I tested this on my production AMD EPYC game node with a UDP flood that peaked around 500k PPS. The eBPF program kept the CPU interrupt load low enough that the servers stayed responsive for about 34 seconds, right up until my upstream provider null-routed the box to protect their core network. 
 
+### Performance Audit (500k PPS Stress Test)
+<details>
+<summary>Click to view the performance audit visual</summary>
+
+![Performance Audit](./media/stress-test.gif)
+</details>
+
 You can replay the 22-minute stress-test here: 
 **[Performance Audit](https://ray-hosting.com/en-US/performance-audit)**
 
