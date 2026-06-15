@@ -299,7 +299,7 @@ namespace Shared.ShellOperations
             }
 
             // 2. Format command using our sanitized shell operations class
-            string command = GithubGameNodeShelloperations.GarbageCollectNft(string.Join(" ", authorizedPairs));
+            string command = GameNodeShelloperations.GarbageCollectNft(string.Join(" ", authorizedPairs));
 
             // 3. Execute script on remote node via SSH
             var result = await sshService.RunCommandAsync(host.IpAddress, host.User, command, ct);
