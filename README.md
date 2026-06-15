@@ -5,7 +5,7 @@ I pulled my network mitigation code out of my bare-metal orchestrator project. H
 This is the hybrid setup I ended up with to kill the traffic before the CPU utilization goes 100%.
 
 ## The UFW / Docker Nightmare
-A quick warning if you're deploying this: don't use UFW. I wasted a lot of time trying to get UFW and Docker's standalone iptables NAT rules to cooperate but that was not possible. 
+Warning if you're deploying this: don't use UFW. I wasted a lot of time trying to get UFW and Docker's standalone iptables NAT rules to cooperate but that was not possible. 
 
 This setup ignores UFW completely. It injects a custom nftables chain at priority -150 so it catches packets *before* Docker.
 
@@ -21,7 +21,7 @@ nftables alone cannot survive a massive 500k PPS flood on its own. I didn't want
 
 The daemon just watches the nftables blacklist and synchronizes those IPs down into an eBPF map using xdp-tools. Once an IP is in that map, the XDP program drops the packets directly at the NIC driver level.
 
-(The messy caveat here: Because the daemon has to poll and sync the rules, there is a sub-second window where the initial flood packets hit the kernel before the map updates. It's not perfect, but it prevents the CPU from locking up during a sustained attack).
+(The caveat: Because the daemon has to poll and sync the rules, there is a sub-second window where the initial flood packets hit the kernel before the map updates. It's not perfect, but it prevents the CPU from locking up during a sustained attack).
 
 ## Sysctl Tweaks (Mandatory)
 Inside GameNodeShellOperations.cs, there are two kernel tweaks I had to add to keep game servers stable:
