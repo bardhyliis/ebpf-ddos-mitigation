@@ -1,61 +1,132 @@
-Bare-Metal Network Shield (eBPF + nftables)
+# Bare-Metal Network Shield
 
-I pulled my network mitigation code out of my bare-metal orchestrator project. Hosting game servers means dealing with DDoS garbage constantly, and I quickly found out that standard firewalls just choke the CPU to death with hardware interrupts during high-PPS floods, which causes the game containers to desync and eventually kill the host node.
+A hybrid nftables + XDP/eBPF mitigation stack extracted from a game server orchestration platform after repeated issues with high-PPS UDP flood traffic affecting container performance.
 
-This is the hybrid setup I ended up with to kill the traffic before the CPU utilization goes 100%.
-
-## The UFW / Docker Nightmare
-Warning if you're deploying this: don't use UFW. I wasted a lot of time trying to get UFW and Docker's standalone iptables NAT rules to cooperate but that was not possible. 
-
-This setup ignores UFW completely. It injects a custom nftables chain at priority -150 so it catches packets *before* Docker.
-```nftables
-chain raw_checks { type filter hook prerouting priority -150; policy accept; }
-```
-
-## How it Actually Works (The Duct-Tape)
-
-I split the work into two layers:
-
-**1. State Tracking (nftables):** 
-nftables handles the actual per-port logic. TCP gets hard bans for socket exhaustion. UDP is trickier—I use a soft-throttle for reconnect storms (so legit players don't get banned) and an extreme limit for actual floods. If an IP trips that extreme limit, it gets dumped into an @blacklist set for 300 seconds.
-```nftables
-set blacklist { type ipv4_addr; flags dynamic, timeout; size 65535; timeout 300s; }
-ip saddr @blacklist counter name ddos_blacklist_drops drop
-```
-
-**2. The Fast Drop (eBPF + Systemd Service)**
-nftables alone cannot survive a massive 500k PPS flood on its own. I didn't want to bake the sync logic into my main application, so I wrote a separate systemd-managed service to handle it.
-
-The daemon just watches the nftables blacklist and synchronizes those IPs down into an eBPF map using xdp-tools. Once an IP is in that map, the XDP program drops the packets directly at the NIC driver level.
-```bash
-xdp-filter load eth0 -f ipv4,ipv6 --mode native
-xdp-filter ip -m src "$ip"
-```
-
-(The caveat: Because the daemon polls and syncs the rules every 2 seconds, there is a window of up to two seconds where the initial flood packets hit the kernel before the map updates. It's not perfect, but it prevents the CPU from locking up during a sustained attack).
-
-## Sysctl Tweaks (Mandatory)
-Inside GameNodeShellOperations.cs, there are two kernel tweaks I had to add to keep game servers stable:
-* **16MB UDP Buffers:** Bumping rmem_max and wmem_max. using the default *~200KB* buffers will make bursty games like Rust silently drop packets during heavy action and the server threads will stall and cause rubber-banding.
-* **TCP BBR:** I moved off CUBIC congestion control. CUBIC assumes any packet loss is network congestion, which causes rubber-banding. BBR plays way nicer with game traffic.
-```ini
-net.core.rmem_max = 16777216
-net.ipv4.tcp_congestion_control = bbr
-```
-
-## Stress Testing & Current Issues
-
-I tested this on my production AMD EPYC game node with a UDP flood that peaked around 500k PPS. The eBPF program kept the CPU interrupt load low enough that the servers stayed responsive for about 34 seconds, right up until my upstream provider null-routed the box to protect their core network. 
-
-![Performance Audit](./media/stress-test.gif)
-
-You can replay the full 22-minute stress-test here if you wish: 
-**[Performance Audit](https://ray-hosting.com/en-US/performance-audit)**
-
-
-**Things that still need fixing:**
-* If a node hard-reboots while a server is provisioning, the C# GC worker sometimes leaves orphaned nftables chains behind. The garbage_collect_nft.sh script eventually cleans them up, but it's janky.
-* The C# SSH execution could probably be optimized, right now it just opens a new session per GC run.
+The goal is not to replace enterprise DDoS mitigation services or dedicated hardware appliances, but to reduce kernel overhead during sustained flood conditions and help keep game server containers responsive in small-scale bare-metal environments.
 
 ---
-*I use this exact system for [Ray Hosting](https://ray-hosting.com)*"
+
+## Why This Exists
+
+During testing and production operation, I found that relying solely on traditional firewall rules and conntrack-based filtering could still introduce enough CPU and kernel networking overhead to impact running game servers under sustained high packet rates.
+
+This project explores a layered approach:
+
+- nftables for stateful filtering and rate limiting
+- XDP/eBPF for early packet drop paths
+- a small userspace daemon to synchronize state between them
+
+---
+
+## Docker, UFW, and nftables
+
+Docker’s iptables-based networking and UFW can introduce complexity when combined, especially in environments with heavy custom firewalling.
+
+Rather than continuing to layer rules on top of multiple abstractions, I opted to manage filtering directly with nftables.
+
+The ruleset uses a custom chain at a high-priority prerouting hook (`-150`) so traffic can be evaluated early in the networking path before reaching later firewall stages or container networking rules.
+
+---
+
+## Architecture
+
+### 1. Stateful Filtering (nftables)
+
+nftables handles:
+
+- Per-protocol rate limiting
+- Connection tracking-based protections
+- Dynamic blacklist with timeout
+
+IPs that exceed extreme thresholds are added to a blacklist set with a time-based expiration.
+
+---
+
+### 2. Fast-path filtering (XDP/eBPF)
+
+In testing, nftables alone still introduced measurable CPU overhead under sustained high packet rates.
+
+To reduce this overhead, a userspace daemon monitors the nftables blacklist and synchronizes entries into an eBPF map used by an XDP program.
+
+When enabled, XDP allows packets to be dropped very early in the kernel networking path (at the XDP hook in the driver or generic fallback mode depending on system support).
+
+> Note: XDP mode depends on driver support. Systems without native XDP support will fall back to a generic mode in the kernel networking stack.
+
+---
+
+## Implementation Notes
+
+- C# is used for orchestration and remote management of rules
+- nftables rules are generated per-port and deployed dynamically
+- XDP synchronization runs as a systemd service with a 2-second polling interval
+
+This introduces a small window where newly flagged IPs may still reach the kernel before being added to the XDP map.
+
+---
+
+## Kernel Tuning
+
+### UDP buffer sizing
+
+Increasing `rmem_max` and `wmem_max` improves resilience under bursty traffic patterns by reducing packet drops in the kernel receive buffers.
+
+This is especially relevant for real-time game traffic where short bursts can otherwise cause visible desynchronization.
+
+---
+
+### TCP congestion control
+
+This setup uses BBR instead of CUBIC:
+
+- CUBIC can interpret packet loss as congestion
+- BBR tends to behave more consistently under variable network conditions typical in game server traffic
+
+---
+
+## Stress Testing
+
+Tested on an AMD EPYC bare-metal node under synthetic UDP flood conditions reaching approximately 500,000 packets per second.
+
+At peak load, the upstream provider eventually null-routed the box to protect their network.
+
+This behavior is visible in the full 22-minute telemetry replay:
+
+👉 Performance audit: https://ray-hosting.com/en-US/performance-audit
+
+![Stress Test](./media/stress-test.gif)
+
+**Observed behavior:**
+
+- nftables handled initial filtering
+- XDP reduced CPU and softirq pressure under sustained load
+- system remained responsive until upstream provider rate-limited or null-routed traffic
+
+> This is not a guarantee of performance under all conditions; results will vary depending on hardware, driver support, and traffic patterns.
+
+---
+
+## Known Limitations
+
+- The XDP synchronization daemon uses polling (2s interval), which introduces a small propagation delay between detection and hardware map update
+- Orphaned nftables chains may remain after unexpected node restarts and are cleaned up via a garbage collection script
+- SSH-based orchestration introduces overhead compared to fully agent-based systems
+
+---
+
+## Contributing
+
+PRs are welcome, especially in areas such as:
+
+- Reducing or replacing polling-based XDP synchronization
+- Improving nftables chain lifecycle management
+- Reducing SSH overhead in orchestration flows
+
+---
+
+## License / Usage
+
+This is not a reference implementation for DDoS mitigation and should not be considered a substitute for upstream protection services.
+
+It reflects an operational setup that evolved from real-world game hosting workloads where high-PPS UDP traffic and connection spikes were impacting server stability.
+
+The same mitigation stack is currently used in production on my own game hosting infrastructure (Ray Hosting), and is provided here as-is. It may require tuning depending on kernel version, NIC driver behavior, and workload characteristics.
